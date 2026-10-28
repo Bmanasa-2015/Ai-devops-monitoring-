@@ -1,6 +1,13 @@
-
 from flask import Flask, jsonify, request, Response, g
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from flask import Flask, jsonify, request, Response, g
+from prometheus_client import (
+    Counter,
+    Histogram,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
+from sklearn.ensemble import IsolationForest
+import math
 import socket
 import time
 
@@ -18,6 +25,11 @@ REQUEST_LATENCY = Histogram(
     ["method", "endpoint"],
 )
 
+AI_ANOMALY_OBSERVATIONS = Counter(
+    "app_ai_anomaly_observations_total",
+    "Number of anomalous observations detected by the model",
+)
+
 
 @app.before_request
 def start_timer():
@@ -26,9 +38,9 @@ def start_timer():
 
 @app.after_request
 def record_metrics(response):
-    # Do not count Prometheus scrapes as application traffic.
     if request.path != "/metrics":
         endpoint = request.url_rule.rule if request.url_rule else "unmatched"
+
         REQUEST_COUNT.labels(
             request.method, endpoint, str(response.status_code)
         ).inc()
@@ -63,6 +75,67 @@ def info():
         "version": "1.0",
         "environment": "development",
         "timestamp": time.time(),
+    })
+
+
+@app.route("/api/anomaly/detect", methods=["POST"])
+def detect_anomalies():
+    payload = request.get_json(silent=True)
+
+    if not isinstance(payload, dict):
+        return jsonify({"error": "A JSON object is required"}), 400
+
+    values = payload.get("values")
+
+    if (
+        not isinstance(values, list)
+        or not 8 <= len(values) <= 1000
+    ):
+        return jsonify({
+            "error": "Provide between 8 and 1000 numeric values"
+        }), 400
+
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in values
+    ):
+        return jsonify({
+            "error": "All values must be finite numbers"
+        }), 400
+
+    features = [[float(value)] for value in values]
+
+    model = IsolationForest(
+        n_estimators=100,
+        contamination=0.1,
+        random_state=42,
+    )
+
+    labels = model.fit_predict(features)
+    scores = model.decision_function(features)
+
+    results = [
+        {
+            "index": index,
+            "value": float(value),
+            "status": "anomaly" if labels[index] == -1 else "normal",
+            "anomaly_score": round(float(scores[index]), 6),
+        }
+        for index, value in enumerate(values)
+    ]
+
+    anomaly_count = sum(1 for label in labels if label == -1)
+
+    if anomaly_count:
+        AI_ANOMALY_OBSERVATIONS.inc(anomaly_count)
+
+    return jsonify({
+        "algorithm": "IsolationForest",
+        "observations": len(values),
+        "anomaly_count": anomaly_count,
+        "results": results,
     })
 
 
